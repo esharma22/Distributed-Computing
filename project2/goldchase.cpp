@@ -12,6 +12,7 @@
 #include "Map.h"
 #include <fstream>
 #include <signal.h>
+#include <mqueue.h>
 
 using namespace std;
 
@@ -26,11 +27,18 @@ struct GameBoard
 
 Map *gm;
 
-void map_handler(int)
-{
-	gm->drawMap();
-}
+GameBoard *gb;
 
+char plr;
+
+bool exit_game = false;
+
+string queues[5] = {"/qP1", "/qP2", "/qP3", "/qP4", "/qP5"};
+
+mqd_t readq_fd;
+
+
+//Function to send signal to players to update map
 void notify_players(GameBoard *goldmap)
 {
 	for(int i = 0; i < 5; i++)
@@ -42,11 +50,209 @@ void notify_players(GameBoard *goldmap)
 	}	
 }
 
+
+
+int getPlayerNumber(char player)
+{
+	if(player == G_PLR0)
+		return 1;
+
+ 	if(player == G_PLR1)
+		return 2;
+
+	if(player == G_PLR2)
+		return 3;
+
+	if(player == G_PLR3)
+		return 4;
+
+	if(player == G_PLR4)
+		return 5;
+}
+
+
+int getMask()
+{
+	int player = 0;
+	for(int i = 0; i < 5; i++)
+	{
+		if(gb->player[i] != 0)
+		{
+			switch(i)
+			{
+				case 0:
+						if(plr != G_PLR0)
+						{
+							player |= G_PLR0;
+						}
+						break;
+
+				case 1:
+						if(plr != G_PLR1)
+						{
+							player |= G_PLR1;
+						}
+						break;
+
+				case 2:
+						if(plr != G_PLR2)
+						{
+							player |= G_PLR2;
+						}
+						break;
+		
+				case 3:
+						if(plr != G_PLR3)
+						{
+							player |= G_PLR3;
+						}
+						break;
+
+				case 4:
+						if(player != G_PLR4)
+						{
+							player |= G_PLR4;
+						}
+						break;
+			}
+		}
+	}
+	return player;
+}
+
+
+
+void sendMessage()
+{
+	int mask = getMask();
+	int player = gm->getPlayer(mask);
+
+	if(player == 0)
+	{
+		return;
+	}
+	else if(player == 4)
+	{
+		player = 3;
+	}
+	else if(player == 8)
+	{
+		player = 4;
+	}
+	else if(player == 16)
+	{
+		player = 5;
+	}
+
+	string message = gm->getMessage();
+	message = "Player- " + to_string(getPlayerNumber(plr)) + " says " + message;
+	char *m = &message[0];
+
+	mqd_t writeq_fd = mq_open(queues[player - 1].c_str(), O_WRONLY|O_NONBLOCK);
+
+	if(writeq_fd == -1)
+	{
+		perror("Error in opening queue to write\n");
+		exit(1);
+	}
+
+	char msgText[121];
+	memset(msgText, 0, 121);
+	strncpy(msgText, m, 120);
+
+	if(mq_send(writeq_fd, msgText, strlen(msgText), 0) == -1)
+	{
+		perror("Error in sending message\n");
+		exit(1);
+	}
+
+	mq_close(writeq_fd);
+}
+
+
+void broadcastMessage()
+{
+	string message = gm->getMessage();
+	message = "Player- " + to_string(getPlayerNumber(plr)) + " says " + message;
+	char *m = &message[0];
+
+	int ignoreMe = getPlayerNumber(plr) - 1;
+	for(int i = 0; i < 5; i++)
+	{
+		if((gb->player[i] != 0) && (i != ignoreMe))
+		{
+			mqd_t writeq_fd = mq_open(queues[i].c_str(), O_WRONLY|O_NONBLOCK);
+
+			if(writeq_fd == -1)
+			{
+				perror("Error in opening queue to write\n");
+				exit(1);
+			}
+
+			char msgText[121];
+			memset(msgText, 0, 121);
+			strncpy(msgText, m, 120);
+
+			if(mq_send(writeq_fd, msgText, strlen(msgText), 0) == -1)
+			{
+				perror("Error in sending message\n");
+				exit(1);
+			}	
+
+			mq_close(writeq_fd);
+		}
+	}
+}
+
+void readMessage()
+{
+	struct sigevent mq_notification_event;
+	mq_notification_event.sigev_notify=SIGEV_SIGNAL;
+	mq_notification_event.sigev_signo=SIGUSR2;
+	mq_notify(readq_fd, &mq_notification_event);
+
+	int err;
+	char msg[121];
+	memset(msg, 0, 121);
+
+	while((err = mq_receive(readq_fd, msg, 120, NULL)) != -1)
+	{
+		gm->postNotice(msg);
+		memset(msg, 0, 121);
+	}
+
+	if(errno != EAGAIN)
+	{
+		perror("Error in mq_receive\n");
+		exit(1);
+	}
+}
+
+
+//Signal handler
+void map_handler(int signalNumber)
+{
+	if(signalNumber == SIGUSR1)
+	{
+		gm->drawMap();
+	}
+	else if(signalNumber == SIGUSR2)
+	{
+		readMessage();
+	}
+	else if((signalNumber == SIGINT)||(signalNumber == SIGHUP)||(signalNumber == SIGTERM))
+	{
+		exit_game = true;
+	}
+}
+
+
+//Function to add gold to map
 void addGold(GameBoard *goldmap)
 {
-	int counter = 0;                    //To count till only one gold remains
+	int counter = 0;											  //To count till only one gold remains
 	int index = 0;
-	srand(time(NULL));                  //To use random function
+	srand(time(NULL));										  //To use random function
 		
 	while(counter != goldmap->goldcount)
 	{
@@ -66,6 +272,8 @@ void addGold(GameBoard *goldmap)
 	}
 }
 
+
+//Function to add players to the map
 int addPlayer(GameBoard *goldmap, char &player)
 {
 	int index = 0;
@@ -81,6 +289,8 @@ int addPlayer(GameBoard *goldmap, char &player)
 	return index;
 }
 
+
+//Function to check which player is playing
 char availablePlayer(GameBoard *goldmap)
 {
 	for(int i=0; i < 5; i++)
@@ -113,6 +323,7 @@ char availablePlayer(GameBoard *goldmap)
 	return 'N';
 }
 
+
 int main()
 {
    sem_t *mysem;
@@ -125,14 +336,17 @@ int main()
    char player = 'N';
    int current_position;
    bool cleanup = true;
-	
+
 	struct sigaction notifySignal;
 	notifySignal.sa_handler = map_handler;
 	sigemptyset(&notifySignal.sa_mask);
 	notifySignal.sa_flags = 0;
 	notifySignal.sa_restorer = NULL;
 
-	sigaction(SIGUSR1, &notifySignal, NULL);
+	sigaction(SIGUSR1, &notifySignal, NULL);	
+	sigaction(SIGINT, &notifySignal, NULL);
+	sigaction(SIGHUP, &notifySignal, NULL);
+	sigaction(SIGTERM, &notifySignal, NULL);
 
    mysem = sem_open("/ES_semaphore", 
                     O_CREAT|O_EXCL, 
@@ -174,6 +388,7 @@ int main()
       {
          goldmap->player[i] = 0;
       }
+
       ch = &whole_map[0];
 
       int index = 0;
@@ -193,8 +408,7 @@ int main()
 
 		addGold(goldmap);						//Placing gold in map
 
-      //Adding player 1
-      player = G_PLR0;
+      player = G_PLR0;						//Adding player 1
       index = 0;
       while(true)
       {
@@ -233,6 +447,35 @@ int main()
       current_position = addPlayer(goldmap, player);
       sem_post(mysem);
    }
+	gb = goldmap;
+	plr = player;
+
+	struct sigaction messageSignal;
+	messageSignal.sa_handler = map_handler;
+	sigemptyset(&messageSignal.sa_mask);
+	messageSignal.sa_flags = 0;
+	messageSignal.sa_restorer = NULL;
+
+	sigaction(SIGUSR2, &messageSignal, NULL);
+
+	struct mq_attr mq_attributes;
+	mq_attributes.mq_flags = 0;
+	mq_attributes.mq_maxmsg = 10;
+	mq_attributes.mq_msgsize = 120;
+
+	readq_fd = mq_open(queues[getPlayerNumber(player) - 1].c_str(), O_RDONLY|O_CREAT|O_EXCL|O_NONBLOCK,
+							S_IRUSR|S_IWUSR, &mq_attributes);
+
+	if(readq_fd == -1)
+	{
+		perror("Error in creating message queue");
+		exit(1);
+	}
+
+	struct sigevent mq_notification_event;
+	mq_notification_event.sigev_notify=SIGEV_SIGNAL;
+	mq_notification_event.sigev_signo=SIGUSR2;
+	mq_notify(readq_fd, &mq_notification_event);	
 
    Map goldChase(goldmap->map, goldmap->rows, goldmap->columns);
 	gm = &goldChase;
@@ -243,7 +486,7 @@ int main()
    int key = 0;
    bool realGold = false;
    bool exit = false;
-   while(!exit)
+   while(!exit && !exit_game)
    {
 		key = goldChase.getKey();
 		int current_row = current_position / columns;
@@ -427,6 +670,14 @@ int main()
                   sem_post(mysem);
          break;
 
+			case 109:
+						sendMessage();
+			break;
+
+			case 98:
+						broadcastMessage();
+			break;
+
          case 81:
                  sem_wait(mysem);
                  goldmap->map[current_position] &= ~player;
@@ -464,6 +715,13 @@ int main()
 
    //If all players have exited then exit game
    sem_wait(mysem);
+
+	if(exit_game)
+	{
+		goldmap->map[current_position] &= ~player;
+      goldChase.drawMap();
+		notify_players(goldmap);
+	}
    for(int i = 0; i < 5; i++)
    {
       if(goldmap->player[i] == 0)
@@ -484,5 +742,7 @@ int main()
 		sem_close(mysem);
 		sem_unlink("/ES_semaphore");
    }
+	mq_close(readq_fd);
+	mq_unlink(queues[getPlayerNumber(player) - 1].c_str());
    return 0;
 }
